@@ -1,0 +1,30 @@
+[package]
+name = "cli-deps"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Managed external binary dependencies and token-free GitHub release installation"
+
+[dependencies]
+async-trait = "0.1"
+dirs = "6"
+flate2 = "1"
+futures = "0.3"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+self-replace = "1.5"
+serde = { version = "1", features = ["derive"] }
+tar = "0.4"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "fs", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7"
+url = "2.5"
+versions = "8"
+which = "8"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["net"] }

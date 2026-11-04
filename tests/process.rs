@@ -351,7 +351,8 @@ async fn cancellation_kills_a_member_that_floods_its_output_after_the_grace_peri
     let token = CancellationToken::new();
     let args = [
         "-c".into(),
-        "trap '' TERM; echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; yes & yes & yes & exec yes".into(),
+        "trap '' TERM; echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; yes & yes & yes & exec yes"
+            .into(),
         "sh".into(),
         pids_file.display().to_string(),
     ];

@@ -1,12 +1,9 @@
-use cli_deps::{
-    Cache, CancellationToken, CommandRunner, Config, Dependency, EnsureOptions, Error, InstallerFn,
-    Manager, MemoryCache, ProcessRunner,
-};
-use std::{
-    io::Cursor,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+#[cfg(unix)]
+use cli_deps::{Cache, CommandRunner, MemoryCache, ProcessRunner};
+use cli_deps::{CancellationToken, Config, Dependency, EnsureOptions, Error, InstallerFn, Manager};
+#[cfg(unix)]
+use std::path::Path;
+use std::{io::Cursor, path::PathBuf, sync::Arc};
 
 fn temp() -> tempfile::TempDir {
     std::fs::create_dir_all(".tmp").unwrap();
@@ -128,7 +125,9 @@ async fn ensure_eof_rejects_install_and_batches_keep_partial_failures() {
     ));
 }
 
+#[cfg(unix)]
 struct BrokenCache;
+#[cfg(unix)]
 impl Cache for BrokenCache {
     fn get(&self, _: &str) -> cli_deps::Result<Option<String>> {
         Err(Error::Message("cache read failed".into()))
@@ -358,4 +357,25 @@ async fn version_check_distinguishes_outdated_invalid_and_process_failure() {
             .to_string()
             .contains("no installer")
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn executables_still_open_for_writing_are_retried_until_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp();
+    let path = std::fs::canonicalize(dir.path()).unwrap().join("tool");
+    let mut writer = std::fs::File::create(&path).unwrap();
+    std::io::Write::write_all(&mut writer, b"#!/bin/sh\necho ran\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let close = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(writer);
+    };
+    let runner = ProcessRunner::default();
+    let (output, ()) = tokio::join!(
+        runner.run(path.to_str().unwrap(), &[], &CancellationToken::new()),
+        close
+    );
+    assert_eq!(output.unwrap(), b"ran\n");
 }

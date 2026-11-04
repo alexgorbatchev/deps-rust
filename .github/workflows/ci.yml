@@ -51,8 +51,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Lint library
-        run: cargo clippy --lib --locked -- -D warnings
-
-      - name: Build all targets
-        run: cargo build --all-targets --locked
+      - name: Lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings

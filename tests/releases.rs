@@ -1,3 +1,4 @@
+#![cfg(unix)]
 use axum::{
     Router,
     http::{StatusCode, header::LOCATION},
@@ -62,7 +63,6 @@ async fn server(binary: &str, contents: &[u8]) -> (String, tokio::task::JoinHand
     (url, task)
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn release_fallback_installer_self_upgrade_and_latest_guard() {
     let (url, task) = server("tool", b"replacement").await;
@@ -121,7 +121,6 @@ async fn release_fallback_installer_self_upgrade_and_latest_guard() {
     task.abort();
 }
 
-#[cfg(unix)]
 #[test]
 fn self_update_subprocess_helper() {
     let Ok(url) = std::env::var("CLI_DEPS_SELF_UPDATE_URL") else {
@@ -144,7 +143,6 @@ fn self_update_subprocess_helper() {
 /// Runs a just-written executable. On Linux, a child forked concurrently by
 /// another test can briefly hold the descriptor that wrote it, so `exec`
 /// fails with ETXTBSY until that child execs.
-#[cfg(unix)]
 async fn run_written(command: &mut tokio::process::Command) -> std::process::Output {
     for _ in 0..100 {
         match command.output().await {
@@ -157,7 +155,6 @@ async fn run_written(command: &mut tokio::process::Command) -> std::process::Out
     panic!("executable stayed busy");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn self_update_replaces_an_actual_running_executable() {
     let dir = temp();

@@ -78,6 +78,9 @@ pub fn sanitize_stderr(stderr: &str) -> String {
     lines().next_back().unwrap_or("").to_owned()
 }
 
+/// Spawn attempts while the executable is busy, 10 ms apart.
+const SPAWN_BUSY_RETRIES: u32 = 100;
+
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, name: &str, args: &[String], token: &CancellationToken) -> Result<Vec<u8>>;
@@ -106,7 +109,25 @@ impl CommandRunner for ProcessRunner {
         if let Some(path) = &self.path {
             command.env("PATH", path);
         }
-        let output = cancellable(token, async { Ok(command.output().await?) }).await?;
+        let output = cancellable(token, async {
+            // On Linux, `exec` of a just-written executable fails with ETXTBSY
+            // while a child forked concurrently elsewhere in the process still
+            // holds the descriptor that wrote it; it clears once that child execs.
+            let mut attempts = 0;
+            loop {
+                match command.output().await {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempts < SPAWN_BUSY_RETRIES =>
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    output => return Ok(output?),
+                }
+            }
+        })
+        .await?;
         if !output.status.success() {
             return Err(Error::Command {
                 name: name.to_owned(),

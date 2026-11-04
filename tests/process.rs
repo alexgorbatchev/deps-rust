@@ -59,6 +59,17 @@ fn alive(pid: i32) -> bool {
     rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
 }
 
+/// Reports whether `pid` exists and is not a zombie. An exited grandchild stays
+/// a zombie until init reaps it, and macOS group signals skip zombies.
+fn running(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&output.stdout);
+    !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+
 async fn wait_until_exited(pids: &[i32]) {
     let deadline = Instant::now() + WAIT;
     while pids.iter().any(|pid| alive(*pid)) {
@@ -231,7 +242,8 @@ async fn executables_still_open_for_writing_are_retried_until_closed() {
 }
 
 /// Writes a script whose SIGTERM handler writes more than a pipe buffer to its
-/// standard error and output, then records that its cleanup completed.
+/// standard error and output, then records that its cleanup completed. The
+/// grandchild starts before the handler is installed, so it never runs it.
 fn noisy_cleanup_script(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::fs::canonicalize(dir).unwrap();
@@ -240,10 +252,11 @@ fn noisy_cleanup_script(dir: &Path) -> PathBuf {
         &path,
         format!(
             "#!/bin/sh\n\
+             sleep 30 &\n\
              trap 'head -c 200000 /dev/zero >&2; echo stopping; echo cleaned >> \"{dir}/record\"; exit 0' TERM\n\
-             echo \"$$\" > \"{dir}/pids.tmp\"\n\
+             echo \"$$ $!\" > \"{dir}/pids.tmp\"\n\
              mv \"{dir}/pids.tmp\" \"{dir}/pids\"\n\
-             sleep 30\n",
+             while :; do wait; done\n",
             dir = dir.display(),
         ),
     )
@@ -321,7 +334,7 @@ fn runtime_shutdown_waits_for_a_dropped_command_to_be_killed() {
         "shutdown waited through the grace period"
     );
     for pid in &pids {
-        assert!(!alive(*pid), "process {pid} survived runtime shutdown");
+        assert!(!running(*pid), "process {pid} survived runtime shutdown");
     }
     assert_eq!(records(dir.path()), "term\n");
 }

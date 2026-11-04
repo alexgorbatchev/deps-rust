@@ -5,7 +5,22 @@ use axum::{
     routing::get,
 };
 use cli_deps::{CancellationToken, Error, ReleaseChannel, Update, Updater};
-use std::io::Write;
+use std::{io::Write, path::Path, process::Output, time::Duration};
+
+/// Runs a just-written executable. On Linux, a child forked concurrently by
+/// another test can briefly hold the descriptor that wrote it, so `exec`
+/// fails with ETXTBSY until that child execs.
+fn run_written(path: &Path) -> Output {
+    for _ in 0..100 {
+        match std::process::Command::new(path).output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            output => return output.unwrap(),
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
 
 fn archive() -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -56,7 +71,7 @@ async fn explicit_release_channel_updates_only_fixture_and_current_is_success() 
             .unwrap(),
         Update::Installed("9.0.0".into())
     );
-    let output = std::process::Command::new(&destination).output().unwrap();
+    let output = run_written(&destination);
     assert!(output.status.success());
     assert_eq!(output.stdout, b"new-version\n");
     let before = std::fs::read(&destination).unwrap();
@@ -188,9 +203,6 @@ async fn updater_pins_checked_tag_when_latest_changes_during_download() {
         Update::Installed("9.0.0".into())
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        std::process::Command::new(target).output().unwrap().stdout,
-        b"new-version\n"
-    );
+    assert_eq!(run_written(&target).stdout, b"new-version\n");
     server.abort();
 }

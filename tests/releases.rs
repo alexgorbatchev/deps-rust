@@ -141,6 +141,22 @@ fn self_update_subprocess_helper() {
     });
 }
 
+/// Runs a just-written executable. On Linux, a child forked concurrently by
+/// another test can briefly hold the descriptor that wrote it, so `exec`
+/// fails with ETXTBSY until that child execs.
+#[cfg(unix)]
+async fn run_written(command: &mut tokio::process::Command) -> std::process::Output {
+    for _ in 0..100 {
+        match command.output().await {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            output => return output.unwrap(),
+        }
+    }
+    panic!("executable stayed busy");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn self_update_replaces_an_actual_running_executable() {
@@ -148,21 +164,18 @@ async fn self_update_replaces_an_actual_running_executable() {
     let executable = dir.path().join("child-test");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     let (url, task) = server("child-test", b"#!/bin/sh\nprintf 'updated\\n'\n").await;
-    let output = tokio::process::Command::new(&executable)
-        .args(["--exact", "self_update_subprocess_helper", "--nocapture"])
-        .env("CLI_DEPS_SELF_UPDATE_URL", url)
-        .output()
-        .await
-        .unwrap();
+    let output = run_written(
+        tokio::process::Command::new(&executable)
+            .args(["--exact", "self_update_subprocess_helper", "--nocapture"])
+            .env("CLI_DEPS_SELF_UPDATE_URL", url),
+    )
+    .await;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = tokio::process::Command::new(&executable)
-        .output()
-        .await
-        .unwrap();
+    let output = run_written(&mut tokio::process::Command::new(&executable)).await;
     assert_eq!(output.stdout, b"updated\n");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     task.abort();

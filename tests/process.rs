@@ -229,3 +229,99 @@ async fn executables_still_open_for_writing_are_retried_until_closed() {
     let (output, ()) = tokio::join!(runner.run(path.as_os_str(), &[], &token), close);
     assert_eq!(output.unwrap(), b"ran\n");
 }
+
+/// Writes a script whose SIGTERM handler writes more than a pipe buffer to its
+/// standard error and output, then records that its cleanup completed.
+fn noisy_cleanup_script(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let path = dir.join("noisy.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             trap 'head -c 200000 /dev/zero >&2; echo stopping; echo cleaned >> \"{dir}/record\"; exit 0' TERM\n\
+             echo \"$$\" > \"{dir}/pids.tmp\"\n\
+             mv \"{dir}/pids.tmp\" \"{dir}/pids\"\n\
+             sleep 30\n",
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn cancellation_keeps_output_pipes_open_while_the_group_handles_sigterm() {
+    let dir = temp();
+    let child = noisy_cleanup_script(dir.path());
+    let runner = ProcessRunner {
+        termination_grace: WAIT,
+        ..Default::default()
+    };
+    let token = CancellationToken::new();
+    let started = Instant::now();
+    let (result, pids) = tokio::join!(
+        runner.run(child.as_os_str(), &[], &token),
+        cancel_when_ready(dir.path(), token.clone()),
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(
+        records(dir.path()),
+        "cleaned\n",
+        "the SIGTERM handler finished"
+    );
+    assert!(started.elapsed() < WAIT, "the group exited without SIGKILL");
+    assert!(!alive(pids[0]));
+}
+
+#[tokio::test]
+async fn dropping_a_running_command_keeps_output_pipes_open_while_the_group_handles_sigterm() {
+    let dir = temp();
+    let child = noisy_cleanup_script(dir.path());
+    let runner = ProcessRunner {
+        termination_grace: WAIT,
+        ..Default::default()
+    };
+    let token = CancellationToken::new();
+    let pids = tokio::select! {
+        result = runner.run(child.as_os_str(), &[], &token) => panic!("child finished: {result:?}"),
+        pids = pids(dir.path()) => pids,
+    };
+    wait_until_exited(&pids).await;
+    assert_eq!(
+        records(dir.path()),
+        "cleaned\n",
+        "the SIGTERM handler finished"
+    );
+}
+
+#[test]
+fn runtime_shutdown_waits_for_a_dropped_command_to_be_killed() {
+    let dir = temp();
+    let child = script(dir.path(), true);
+    let grace = Duration::from_millis(300);
+    let runner = ProcessRunner {
+        termination_grace: grace,
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let pids = runtime.block_on(async {
+        let token = CancellationToken::new();
+        tokio::select! {
+            result = runner.run(child.as_os_str(), &[], &token) => panic!("child finished: {result:?}"),
+            pids = pids(dir.path()) => pids,
+        }
+    });
+    let dropped = Instant::now();
+    drop(runtime);
+    assert!(
+        dropped.elapsed() >= grace,
+        "shutdown waited through the grace period"
+    );
+    for pid in &pids {
+        assert!(!alive(*pid), "process {pid} survived runtime shutdown");
+    }
+    assert_eq!(records(dir.path()), "term\n");
+}

@@ -1,6 +1,6 @@
 ---
 created_on: 2026-10-14 05:46
-last_modified: 2026-11-04 12:15
+last_modified: 2026-11-04 12:19
 status: current
 ---
 
@@ -25,7 +25,7 @@ This library manages external executables. It has no CLI entrypoint.
 - Preserve prior executables on failed downloads. From release archives extract only the requested regular file, keep temporary files beside the destination, and use native atomic replacement. Keep self-update tied to the release tag used for the version check.
 - Install yt-dlp from the unpacked (PyInstaller one-folder) release archives, never the one-file builds, which unpack into the system temporary directory on every run and leak it when killed. Extract the whole archive into `.yt-dlp/<install>/` under the managed directory with the zip crate's traversal-safe extraction, preserving Unix modes and symbolic links. On Unix, switch installs by atomically renaming the relative `yt-dlp` symbolic link and keep the replaced install for runs still using it; on Windows, which may lack symbolic-link privileges, swap the `.yt-dlp/current` folder that managed lookups search. Hold the `.yt-dlp/.lock` file lock from extraction through cleanup. Update by downloading the build again; unpacked builds do not support `yt-dlp -U`.
 - Prefer a global executable that satisfies the minimum version; fall back to the managed copy only when the global one is missing or too old. Installers write only to the managed directory. Child processes use `Manager::child_path`, which keeps by-name lookups consistent with that resolution.
-- Start `ProcessRunner` children in a new session on Unix, so each leads its own process group without a controlling terminal. On cancellation or a dropped `run` future, send SIGTERM to the group and SIGKILL only after the bounded `termination_grace`. Test termination with real subprocesses that trap signals.
+- Start `ProcessRunner` children in a new session on Unix, so each leads its own process group without a controlling terminal. On cancellation or a dropped `run` future, send SIGTERM to the group and SIGKILL only after the bounded `termination_grace`. Keep the output pipes open and drained until the group is gone. Finish a dropped run's termination in a Tokio blocking task so runtime shutdown waits for it, and send SIGKILL at once when that task is discarded. Test termination with real subprocesses that trap signals.
 - Keep release configuration policy in the caller. `Updater` takes an explicit `ReleaseChannel`; absent channels return typed `Error::Unpublished` without network access. Test running-executable replacement only in disposable copied child binaries.
 - Propagate cache failures and use typed missing-command errors. Never grant installation consent on EOF or prompt in agent mode.
 - Any code change affecting runtime results requires a corresponding test-file change and at least 90% line and function coverage; `scripts/` is excluded. Develop red/green and verify a disabled implementation fails its behavioral tests before restoring it.

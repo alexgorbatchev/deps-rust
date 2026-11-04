@@ -338,3 +338,36 @@ fn runtime_shutdown_waits_for_a_dropped_command_to_be_killed() {
     }
     assert_eq!(records(dir.path()), "term\n");
 }
+
+#[tokio::test]
+async fn cancellation_kills_a_member_that_floods_its_output_after_the_grace_period() {
+    let dir = temp();
+    let pids_file = std::fs::canonicalize(dir.path()).unwrap().join("pids");
+    let grace = Duration::from_millis(300);
+    let runner = ProcessRunner {
+        termination_grace: grace,
+        ..Default::default()
+    };
+    let token = CancellationToken::new();
+    let args = [
+        "-c".into(),
+        "trap '' TERM; echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; yes & yes & yes & exec yes".into(),
+        "sh".into(),
+        pids_file.display().to_string(),
+    ];
+    let ((result, finished), (pids, cancelled)) = tokio::join!(
+        async {
+            let result = runner.run("sh".as_ref(), &args, &token).await;
+            (result, Instant::now())
+        },
+        async {
+            let pids = cancel_when_ready(dir.path(), token.clone()).await;
+            (pids, Instant::now())
+        },
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    let elapsed = finished - cancelled;
+    assert!(elapsed >= grace, "SIGKILL waits for the grace period");
+    assert!(elapsed < WAIT, "draining the flood held off SIGKILL");
+    assert!(!running(pids[0]), "the flooding member is killed");
+}

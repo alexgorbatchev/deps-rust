@@ -438,18 +438,24 @@ impl Reaper {
                 .is_some_and(|pid| rustix::process::test_kill_process_group(pid).is_ok())
     }
 
-    /// Discards available output, closing pipes that reach end of file or fail.
+    /// Discards up to `DRAIN_LIMIT` bytes of available output from each pipe,
+    /// closing pipes that reach end of file or fail. The limit keeps a member
+    /// that writes without pause from holding off the deadline checks.
     fn drain(&mut self) {
+        const DRAIN_LIMIT: usize = 1 << 20;
         let mut buffer = [0; 8192];
         self.pipes.retain(|pipe| {
-            loop {
+            let mut drained = 0;
+            while drained < DRAIN_LIMIT {
                 match rustix::io::read(pipe, &mut buffer) {
-                    Ok(0) => break false,
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(rustix::io::Errno::AGAIN) => break true,
-                    Err(_) => break false,
+                    Ok(0) => return false,
+                    Ok(read) => drained += read,
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(rustix::io::Errno::AGAIN) => return true,
+                    Err(_) => return false,
                 }
             }
+            true
         });
     }
 }

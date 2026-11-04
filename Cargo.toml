@@ -2,7 +2,7 @@
 name = "cli-deps"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 description = "Managed external binary dependencies and token-free GitHub release installation"
 
@@ -24,6 +24,9 @@ url = "2.5"
 versions = "8"
 which = "8"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 axum = "0.8"

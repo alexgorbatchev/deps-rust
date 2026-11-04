@@ -179,6 +179,7 @@ dependencies = [
  "futures",
  "regex",
  "reqwest",
+ "rustix",
  "self-replace",
  "serde",
  "tar",

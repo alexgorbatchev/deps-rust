@@ -125,7 +125,7 @@ fn managed_directories_follow_xdg_and_home_and_agent_mode_never_prompts() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn package_installers_select_available_native_manager_and_preserve_arguments() {
     use std::os::unix::fs::PermissionsExt;
@@ -133,11 +133,16 @@ fn package_installers_select_available_native_manager_and_preserve_arguments() {
     let dir = tempfile::tempdir_in(".tmp").unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let record = root.join("arguments");
-    for (program, expected) in [
-        ("apt-get", "install\n-y\nexample-package\n"),
-        ("pacman", "-S\n--noconfirm\nexample-package\n"),
-        ("dnf", "install\n-y\nexample-package\n"),
-    ] {
+    let managers: &[(&str, &str)] = if cfg!(target_os = "macos") {
+        &[("brew", "install\nexample-package\n")]
+    } else {
+        &[
+            ("apt-get", "install\n-y\nexample-package\n"),
+            ("pacman", "-S\n--noconfirm\nexample-package\n"),
+            ("dnf", "install\n-y\nexample-package\n"),
+        ]
+    };
+    for (program, expected) in managers {
         let executable = root.join(program);
         std::fs::write(
             &executable,
@@ -153,7 +158,7 @@ fn package_installers_select_available_native_manager_and_preserve_arguments() {
                 ("CLI_DEPS_RECORD", record.as_os_str()),
             ],
         );
-        assert_eq!(std::fs::read_to_string(&record).unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), *expected);
         std::fs::remove_file(executable).unwrap();
     }
     invoke("no-package", &root, &[("PATH", root.as_os_str())]);

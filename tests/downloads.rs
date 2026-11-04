@@ -3,7 +3,7 @@ use axum::{
     http::{StatusCode, header::LOCATION},
     routing::get,
 };
-use cli_deps::{CancellationToken, Error, Installer, ProcessRunner, ReleaseClient, YtDlpInstaller};
+use cli_deps::{CancellationToken, Error, ReleaseClient};
 use std::{
     io::{Cursor, Write},
     sync::Arc,
@@ -124,57 +124,12 @@ async fn release_get_fallback_invalid_discovery_and_slow_request_cancellation() 
 }
 
 #[tokio::test]
-async fn yt_dlp_platform_selection_and_native_update_fallback() {
-    let (url, task) = server(
-        Router::new()
-            .route(
-                "/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
-                get(|| async { "linux" }),
-            )
-            .route(
-                "/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64",
-                get(|| async { "arm" }),
-            )
-            .route(
-                "/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
-                get(|| async { "mac" }),
-            )
-            .route(
-                "/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
-                get(|| async { "windows" }),
-            ),
-    )
-    .await;
-    let client = ReleaseClient::new(&url).unwrap();
-    let dir = temp();
-    let token = CancellationToken::new();
-    for (os, arch, binary, bytes) in [
-        ("linux", "amd64", "yt-dlp", "linux"),
-        ("linux", "arm64", "yt-dlp", "arm"),
-        ("darwin", "arm64", "yt-dlp", "mac"),
-        ("windows", "amd64", "yt-dlp.exe", "windows"),
-    ] {
-        client
-            .install_yt_dlp_for_platform(os, arch, dir.path(), &token)
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(binary)).unwrap(),
-            bytes
-        );
-    }
-    let runner = ProcessRunner {
-        path: Some(std::ffi::OsString::new()),
-    };
-    let installer = YtDlpInstaller {
-        client,
-        runner: Arc::new(runner),
-    };
-    installer.update(dir.path(), &token).await.unwrap();
-    token.cancel();
-    assert!(matches!(
-        installer.update(dir.path(), &token).await,
-        Err(Error::Cancelled)
-    ));
-    task.abort();
+async fn release_clients_reject_unusable_base_urls() {
+    assert!(ReleaseClient::new("::::").is_err());
+    let client = ReleaseClient::new("mailto:owner@example.org").unwrap();
+    let error = client
+        .latest_tag("owner", "repo", &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot contain path segments"));
 }

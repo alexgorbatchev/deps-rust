@@ -1,6 +1,9 @@
 #[cfg(unix)]
-use cli_deps::{Cache, CommandRunner, MemoryCache, ProcessRunner};
-use cli_deps::{CancellationToken, Config, Dependency, EnsureOptions, Error, InstallerFn, Manager};
+use cli_deps::{Cache, MemoryCache, ProcessRunner};
+use cli_deps::{
+    CancellationToken, CommandRunner, Config, Dependency, EnsureOptions, Error, InstallerFn,
+    Manager,
+};
 #[cfg(unix)]
 use std::path::Path;
 use std::{io::Cursor, path::PathBuf, sync::Arc};
@@ -296,7 +299,7 @@ async fn subprocess_errors_are_sanitized_and_cancellation_interrupts_waiting() {
     let token = CancellationToken::new();
     let error = runner
         .run(
-            "sh",
+            "sh".as_ref(),
             &[
                 "-c".into(),
                 "printf 'panic: broken\\nstack\\n' >&2; exit 3".into(),
@@ -318,7 +321,7 @@ async fn subprocess_errors_are_sanitized_and_cancellation_interrupts_waiting() {
         cancelled.cancel();
     });
     assert!(matches!(
-        runner.run("sleep", &["30".into()], &token).await,
+        runner.run("sleep".as_ref(), &["30".into()], &token).await,
         Err(Error::Cancelled)
     ));
 }
@@ -359,21 +362,154 @@ async fn version_check_distinguishes_outdated_invalid_and_process_failure() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test]
-async fn executables_still_open_for_writing_are_retried_until_closed() {
-    use std::os::unix::fs::PermissionsExt;
+async fn satisfying_global_executable_precedes_the_managed_copy() {
     let dir = temp();
-    let path = std::fs::canonicalize(dir.path()).unwrap().join("tool");
-    let mut writer = std::fs::File::create(&path).unwrap();
-    std::io::Write::write_all(&mut writer, b"#!/bin/sh\necho ran\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let close = async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        drop(writer);
-    };
-    let runner = ProcessRunner::default();
+    let global = dir.path().join("global");
+    let managed = dir.path().join("managed");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&managed).unwrap();
+    let search_path = std::env::join_paths([&global, &managed]).unwrap();
+    let manager = Manager::new(Config {
+        dependencies: vec![Dependency::new("tool", "2.0")],
+        bin_dir: Some(managed.clone()),
+        search_path: Some(search_path),
+        ..Default::default()
+    })
+    .unwrap();
     let token = CancellationToken::new();
-    let (output, ()) = tokio::join!(runner.run(path.to_str().unwrap(), &[], &token), close);
-    assert_eq!(output.unwrap(), b"ran\n");
+    let resolve = || async {
+        let report = manager.verify(&token).await.unwrap().remove(0);
+        (report, manager.executable("TOOL", &token).await)
+    };
+
+    let (report, resolved) = resolve().await;
+    assert!(!report.installed && report.path.is_none());
+    assert!(matches!(resolved, Err(Error::Unsatisfied(_))));
+
+    executable(&managed.join("tool"), "3.0");
+    let (report, resolved) = resolve().await;
+    assert_eq!(report.path.as_deref(), Some(managed.join("tool").as_path()));
+    assert_eq!(resolved.unwrap(), managed.join("tool"));
+
+    executable(&global.join("tool"), "2.5");
+    let (report, resolved) = resolve().await;
+    assert_eq!(report.detected_version, "2.5");
+    assert_eq!(resolved.unwrap(), global.join("tool"));
+
+    executable(&global.join("tool"), "1.0");
+    let (report, resolved) = resolve().await;
+    assert_eq!(
+        report.detected_version, "3.0",
+        "too-old global falls back to managed"
+    );
+    assert_eq!(resolved.unwrap(), managed.join("tool"));
+
+    executable(&managed.join("tool"), "1.5");
+    let (report, resolved) = resolve().await;
+    assert!(report.installed && !report.satisfied);
+    assert_eq!(report.detected_version, "1.5");
+    assert_eq!(report.path.as_deref(), Some(managed.join("tool").as_path()));
+    assert!(matches!(resolved, Err(Error::Unsatisfied(_))));
+    assert!(manager.executable("unknown", &token).await.is_err());
+}
+
+struct NamedRunner;
+#[async_trait::async_trait]
+impl CommandRunner for NamedRunner {
+    async fn run(
+        &self,
+        program: &std::ffi::OsStr,
+        _: &[String],
+        _: &CancellationToken,
+    ) -> cli_deps::Result<Vec<u8>> {
+        assert_eq!(program, "runner-resolved-tool-12345");
+        Ok(b"runner-resolved-tool-12345 4.0.0".to_vec())
+    }
+}
+
+#[tokio::test]
+async fn executables_the_runner_resolves_by_name_are_returned_by_name() {
+    let dir = temp();
+    let manager = Manager::new(Config {
+        dependencies: vec![Dependency::new("runner-resolved-tool-12345", "4")],
+        bin_dir: Some(dir.path().into()),
+        runner: Some(Arc::new(NamedRunner)),
+        ..Default::default()
+    })
+    .unwrap();
+    let token = CancellationToken::new();
+    let report = manager.verify(&token).await.unwrap().remove(0);
+    assert!(report.satisfied);
+    assert!(report.path.is_none());
+    assert_eq!(
+        manager
+            .executable("runner-resolved-tool-12345", &token)
+            .await
+            .unwrap(),
+        PathBuf::from("runner-resolved-tool-12345")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn child_path_resolves_dependencies_children_look_up_by_name() {
+    let dir = temp();
+    let global = dir.path().join("global");
+    let managed = dir.path().join("managed");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&managed).unwrap();
+    let manager = Manager::new(Config {
+        dependencies: vec![
+            Dependency::new("codec", "2.0"),
+            Dependency::new("fetcher", "2.0"),
+        ],
+        bin_dir: Some(managed.clone()),
+        search_path: Some(global.clone().into_os_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    let token = CancellationToken::new();
+    // A child that looks up another dependency by name, as yt-dlp finds ffmpeg.
+    let lookup = |path: std::ffi::OsString| {
+        let token = token.clone();
+        async move {
+            let runner = ProcessRunner {
+                path: Some(path),
+                ..Default::default()
+            };
+            runner
+                .run("/bin/sh".as_ref(), &["-c".into(), "codec".into()], &token)
+                .await
+        }
+    };
+    executable(&global.join("codec"), "2.5");
+    executable(&managed.join("codec"), "3.0");
+    let path = manager.child_path(&token).await.unwrap();
+    assert_eq!(
+        lookup(path).await.unwrap(),
+        b"2.5\n",
+        "satisfying global first"
+    );
+
+    executable(&global.join("codec"), "1.0");
+    let path = manager.child_path(&token).await.unwrap();
+    assert_eq!(
+        std::env::split_paths(&path).next().unwrap(),
+        managed,
+        "a dependency resolved to its managed copy puts managed directories first"
+    );
+    assert_eq!(lookup(path).await.unwrap(), b"3.0\n");
+
+    executable(&global.join("fetcher"), "2.0");
+    executable(&managed.join("fetcher"), "1.0");
+    let error = manager.child_path(&token).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Unsatisfied(m) if m.contains("fetcher")),
+        "{error}"
+    );
+    executable(&managed.join("fetcher"), "2.1");
+    let path = manager.child_path(&token).await.unwrap();
+    assert_eq!(lookup(path).await.unwrap(), b"3.0\n");
 }

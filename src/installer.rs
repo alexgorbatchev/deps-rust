@@ -36,7 +36,7 @@ impl ReleaseClient {
         Self::new("https://github.com")
     }
 
-    fn url(&self, segments: &[&str]) -> Result<Url> {
+    pub(crate) fn url(&self, segments: &[&str]) -> Result<Url> {
         let mut url = self.base_url.clone();
         url.path_segments_mut()
             .map_err(|_| message("base URL cannot contain path segments"))?
@@ -88,6 +88,25 @@ impl ReleaseClient {
         token: &CancellationToken,
     ) -> Result<PathBuf> {
         validate_binary(binary)?;
+        let download = self.download(url, directory, token).await?;
+        let binary = binary.to_owned();
+        let directory = directory.to_owned();
+        let token = token.clone();
+        let url = url.to_owned();
+        tokio::task::spawn_blocking(move || {
+            extract_asset(download, &url, &binary, &directory, &token)
+        })
+        .await
+        .map_err(|e| message(format!("extracting release asset: {e}")))?
+    }
+
+    /// Streams `url` into a temporary file inside `directory`.
+    pub(crate) async fn download(
+        &self,
+        url: &str,
+        directory: &Path,
+        token: &CancellationToken,
+    ) -> Result<tempfile::NamedTempFile> {
         std::fs::create_dir_all(directory)?;
         let download = tempfile::NamedTempFile::new_in(directory)?;
         let mut writer = tokio::fs::File::from_std(download.reopen()?);
@@ -107,16 +126,7 @@ impl ReleaseClient {
             Ok(())
         })
         .await?;
-        drop(writer);
-        let binary = binary.to_owned();
-        let directory = directory.to_owned();
-        let token = token.clone();
-        let url = url.to_owned();
-        tokio::task::spawn_blocking(move || {
-            extract_asset(download, &url, &binary, &directory, &token)
-        })
-        .await
-        .map_err(|e| message(format!("extracting release asset: {e}")))?
+        Ok(download)
     }
 
     pub async fn install_release(
@@ -164,25 +174,6 @@ impl ReleaseClient {
             }
         }
         Err(last_error.expect("two download attempts"))
-    }
-
-    pub async fn install_yt_dlp_for_platform(
-        &self,
-        os: &str,
-        arch: &str,
-        directory: &Path,
-        token: &CancellationToken,
-    ) -> Result<PathBuf> {
-        let (asset, binary) = match (os, arch) {
-            ("darwin" | "macos", _) => ("yt-dlp_macos", "yt-dlp"),
-            ("windows", _) => ("yt-dlp.exe", "yt-dlp.exe"),
-            ("linux", "arm64" | "aarch64") => ("yt-dlp_linux_aarch64", "yt-dlp"),
-            ("linux", _) => ("yt-dlp_linux", "yt-dlp"),
-            _ => ("yt-dlp", "yt-dlp"),
-        };
-        let url = self.url(&["yt-dlp", "yt-dlp", "releases", "latest", "download", asset])?;
-        self.install_asset(url.as_str(), binary, directory, token)
-            .await
     }
 }
 
@@ -294,7 +285,7 @@ fn copy_checked(
         writer.write_all(&bytes[..n])?;
     }
 }
-fn release_platform() -> (&'static str, &'static str) {
+pub(crate) fn release_platform() -> (&'static str, &'static str) {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         os => os,
@@ -344,34 +335,6 @@ impl Installer for ReleaseInstaller {
     }
 }
 
-pub struct YtDlpInstaller {
-    pub client: ReleaseClient,
-    pub runner: Arc<dyn CommandRunner>,
-}
-#[async_trait]
-impl Installer for YtDlpInstaller {
-    async fn install(&self, directory: &Path, token: &CancellationToken) -> Result<()> {
-        let (os, arch) = release_platform();
-        self.client
-            .install_yt_dlp_for_platform(os, arch, directory, token)
-            .await
-            .map(|_| ())
-    }
-    async fn update(&self, directory: &Path, token: &CancellationToken) -> Result<()> {
-        match self.runner.run("yt-dlp", &["-U".into()], token).await {
-            Ok(out)
-                if !String::from_utf8_lossy(&out)
-                    .to_ascii_lowercase()
-                    .contains("error") =>
-            {
-                Ok(())
-            }
-            Err(Error::Cancelled) => Err(Error::Cancelled),
-            _ => self.install(directory, token).await,
-        }
-    }
-}
-
 pub struct PackageInstaller {
     pub package: String,
     pub runner: Arc<dyn CommandRunner>,
@@ -402,7 +365,11 @@ impl Installer for PackageInstaller {
                 if *name == "choco" {
                     args.push("-y".into());
                 }
-                return self.runner.run(name, &args, token).await.map(|_| ());
+                return self
+                    .runner
+                    .run(std::ffi::OsStr::new(name), &args, token)
+                    .await
+                    .map(|_| ());
             }
         }
         Err(message(format!(

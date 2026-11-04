@@ -13,7 +13,7 @@ use std::{io::Write, path::Path};
 /// Linux still reports it busy.
 async fn run_written(path: &Path) -> Vec<u8> {
     ProcessRunner::default()
-        .run(path.to_str().unwrap(), &[], &CancellationToken::new())
+        .run(path.as_os_str(), &[], &CancellationToken::new())
         .await
         .unwrap()
 }

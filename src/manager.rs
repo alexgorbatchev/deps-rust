@@ -1,13 +1,15 @@
 use crate::{
     CancellationToken, CommandRunner, Error, Installer, ProcessRunner, Result, compare_versions,
     default_version_parser, ensure_managed_bin_dir, is_agent_mode, managed_path, message,
+    process::{global_path, join_path, managed_dirs},
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     io::{BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -74,6 +76,10 @@ pub struct DependencyReport {
     pub satisfied: bool,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub error: String,
+    /// The executable that reported `detected_version`, when it was located on disk.
+    /// It is not serialized because paths need not be UTF-8.
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
 }
 impl DependencyReport {
     pub fn summary(&self) -> String {
@@ -102,6 +108,8 @@ pub struct Config {
     pub cache: Option<Arc<dyn Cache>>,
     /// Override the managed directory, useful for isolated installations.
     pub bin_dir: Option<PathBuf>,
+    /// PATH searched for global executables; `None` uses the process `PATH`.
+    pub search_path: Option<OsString>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -111,6 +119,7 @@ impl Default for Config {
             runner: None,
             cache: None,
             bin_dir: None,
+            search_path: None,
         }
     }
 }
@@ -140,11 +149,21 @@ impl BatchOutcome {
         }
     }
 }
+/// Checks and installs dependencies.
+///
+/// A global executable that satisfies the minimum version takes precedence. The
+/// managed copy is used when no global executable exists or the global one is too
+/// old, and installers always write to the managed directory.
 pub struct Manager {
     dependencies: Vec<Dependency>,
     runner: Arc<dyn CommandRunner>,
     cache: Option<Arc<dyn Cache>>,
     bin_dir: PathBuf,
+    global_path: Option<OsString>,
+    managed_path: OsString,
+    /// Child `PATH` orders: global entries first, and managed directories first.
+    global_first: OsString,
+    managed_first: OsString,
 }
 impl Manager {
     pub fn new(config: Config) -> Result<Self> {
@@ -163,13 +182,26 @@ impl Manager {
                 return Err(message("dependency names must be nonempty and unique"));
             }
         }
-        let path = managed_path(&bin_dir, std::env::var_os("PATH").as_deref())?;
+        let search_path = config.search_path.or_else(|| std::env::var_os("PATH"));
+        let path = managed_path(&bin_dir, search_path.as_deref())?;
+        let global = global_path(&bin_dir, search_path.as_deref());
         Ok(Self {
             dependencies: config.dependencies,
-            runner: config
-                .runner
-                .unwrap_or_else(|| Arc::new(ProcessRunner { path: Some(path) })),
+            runner: config.runner.unwrap_or_else(|| {
+                Arc::new(ProcessRunner {
+                    path: Some(path),
+                    ..Default::default()
+                })
+            }),
             cache: config.cache,
+            global_first: managed_path(&bin_dir, global.as_deref())?,
+            managed_first: join_path(
+                managed_dirs(&bin_dir)
+                    .into_iter()
+                    .chain(global.iter().flat_map(std::env::split_paths)),
+            )?,
+            global_path: global,
+            managed_path: managed_path(&bin_dir, None)?,
             bin_dir,
         })
     }
@@ -186,6 +218,84 @@ impl Manager {
         .await;
         results.into_iter().collect()
     }
+    /// Returns the executable to run for `name`: the satisfying global or managed copy.
+    pub async fn executable(&self, name: &str, token: &CancellationToken) -> Result<PathBuf> {
+        let dependency = self.dependency(name)?;
+        let report = self.verify_one(dependency, token).await?;
+        if !report.satisfied {
+            return Err(Error::Unsatisfied(report.summary()));
+        }
+        Ok(report
+            .path
+            .unwrap_or_else(|| PathBuf::from(&dependency.name)))
+    }
+    /// Returns a `PATH` for child processes that resolves each dependency by name
+    /// to the copy `verify` selects, including lookups a child makes itself, such
+    /// as yt-dlp finding ffmpeg.
+    ///
+    /// Global entries come first unless a dependency resolved to its managed copy;
+    /// then the managed directories come first. Because that order lets every
+    /// managed copy shadow its global one, a managed copy that is too old while
+    /// the global copy satisfies the minimum returns `Error::Unsatisfied`; update
+    /// that dependency to resolve it.
+    pub async fn child_path(&self, token: &CancellationToken) -> Result<OsString> {
+        let reports = self.verify(token).await?;
+        let managed = managed_dirs(&self.bin_dir);
+        let is_managed = |report: &DependencyReport| {
+            report
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .is_some_and(|dir| managed.iter().any(|m| m == dir))
+        };
+        if !reports.iter().any(|r| r.satisfied && is_managed(r)) {
+            return Ok(self.global_first.clone());
+        }
+        let cwd = std::env::current_dir()?;
+        for (dependency, report) in self.dependencies.iter().zip(&reports) {
+            if !report.satisfied || is_managed(report) {
+                continue;
+            }
+            let Ok(copy) = which::which_in(&dependency.name, Some(&self.managed_path), &cwd) else {
+                continue;
+            };
+            let shadow = self
+                .check(dependency, copy.as_os_str(), Some(&copy), token)
+                .await?;
+            if !shadow.satisfied {
+                return Err(Error::Unsatisfied(format!(
+                    "managed {} would shadow the satisfying global copy",
+                    shadow.summary()
+                )));
+            }
+        }
+        Ok(self.managed_first.clone())
+    }
+    fn dependency(&self, name: &str) -> Result<&Dependency> {
+        self.dependencies
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| message(format!("unknown dependency {name:?}")))
+    }
+    /// Locates the global executable, then the managed one.
+    fn candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
+        let cwd = std::env::current_dir()?;
+        let mut candidates = Vec::new();
+        for path in [
+            self.global_path.as_deref(),
+            Some(self.managed_path.as_os_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(found) = which::which_in(name, Some(path), &cwd)
+                && !candidates.contains(&found)
+            {
+                candidates.push(found);
+            }
+        }
+        Ok(candidates)
+    }
     async fn verify_one(
         &self,
         dependency: &Dependency,
@@ -194,6 +304,33 @@ impl Manager {
         if token.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let mut candidates = self.candidates(&dependency.name)?.into_iter();
+        // Without a located executable the runner resolves the name itself.
+        let Some(first) = candidates.next() else {
+            return self
+                .check(dependency, OsStr::new(&dependency.name), None, token)
+                .await;
+        };
+        let mut report = self
+            .check(dependency, first.as_os_str(), Some(&first), token)
+            .await?;
+        for candidate in candidates {
+            if report.satisfied {
+                break;
+            }
+            report = self
+                .check(dependency, candidate.as_os_str(), Some(&candidate), token)
+                .await?;
+        }
+        Ok(report)
+    }
+    async fn check(
+        &self,
+        dependency: &Dependency,
+        program: &OsStr,
+        path: Option<&Path>,
+        token: &CancellationToken,
+    ) -> Result<DependencyReport> {
         let mut report = DependencyReport {
             name: dependency.name.clone(),
             min_version: dependency.min_version.clone(),
@@ -201,12 +338,12 @@ impl Manager {
             installed: false,
             satisfied: false,
             error: String::new(),
+            path: None,
         };
-        let key = cache_key(&dependency.name);
-        let cached = self
-            .cache
-            .as_ref()
-            .map(|c| c.get(&key))
+        let key = cache_key(&dependency.name, path);
+        let cache = self.cache.as_ref().zip(key.as_deref());
+        let cached = cache
+            .map(|(c, key)| c.get(key))
             .transpose()?
             .flatten()
             .filter(|v| !v.is_empty());
@@ -219,11 +356,11 @@ impl Manager {
             } else {
                 &dependency.version_args
             };
-            let result = self.runner.run(&dependency.name, args, token).await;
-            if let (Some(cache), Ok(output)) = (&self.cache, &result)
+            let result = self.runner.run(program, args, token).await;
+            if let (Some((cache, key)), Ok(output)) = (cache, &result)
                 && !output.is_empty()
             {
-                cache.put(&key, &String::from_utf8_lossy(output))?;
+                cache.put(key, &String::from_utf8_lossy(output))?;
             }
             result
         };
@@ -247,6 +384,7 @@ impl Manager {
             }
             Ok(output) => {
                 report.installed = true;
+                report.path = path.map(ToOwned::to_owned);
                 let output = String::from_utf8_lossy(&output);
                 report.detected_version = dependency.parse_version.as_ref().map_or_else(
                     || default_version_parser(&dependency.name, &output),
@@ -276,17 +414,19 @@ impl Manager {
         if token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let dependency = self
-            .dependencies
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| message(format!("unknown dependency {name:?}")))?;
+        let dependency = self.dependency(name)?;
         let installer = dependency
             .installer
             .as_ref()
             .ok_or_else(|| message(format!("no installer configured for {name:?}")))?;
         if let Some(cache) = &self.cache {
-            cache.delete(&cache_key(&dependency.name))?;
+            let paths = self.candidates(&dependency.name)?;
+            let keys = std::iter::once(None)
+                .chain(paths.iter().map(|p| Some(p.as_path())))
+                .filter_map(|path| cache_key(&dependency.name, path));
+            for key in keys {
+                cache.delete(&key)?;
+            }
         }
         if update {
             installer.update(&self.bin_dir, token).await
@@ -379,6 +519,13 @@ impl Manager {
         }
     }
 }
-fn cache_key(name: &str) -> String {
-    format!("godeps_{name}.json")
+/// Keys cached banners by dependency and, when located, by executable path.
+/// Paths that are not UTF-8 are not cached rather than keyed lossily.
+fn cache_key(name: &str, path: Option<&Path>) -> Option<String> {
+    match path {
+        None => Some(format!("godeps_{name}.json")),
+        Some(path) => path
+            .to_str()
+            .map(|path| format!("godeps_{name}.json@{path}")),
+    }
 }

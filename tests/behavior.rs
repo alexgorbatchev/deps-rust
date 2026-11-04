@@ -66,8 +66,9 @@ fn stderr_and_path_cleaning_preserve_meaning() {
     )
     .unwrap();
     assert_eq!(
-        std::env::split_paths(&path).next().unwrap(),
-        std::path::Path::new("/managed/bin")
+        std::env::split_paths(&path).collect::<Vec<_>>(),
+        ["/usr/bin", "/managed/bin"].map(std::path::PathBuf::from),
+        "global directories precede the managed directory"
     );
     assert_eq!(
         managed_path(std::path::Path::new("/managed/bin"), Some(&path)).unwrap(),

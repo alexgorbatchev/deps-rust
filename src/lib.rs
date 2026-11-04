@@ -4,21 +4,21 @@ mod manager;
 mod process;
 mod updater;
 mod version;
+mod yt_dlp;
 pub use updater::{ReleaseChannel, Update, Updater};
 
-pub use installer::{
-    Installer, InstallerFn, PackageInstaller, ReleaseClient, ReleaseInstaller, YtDlpInstaller,
-};
+pub use installer::{Installer, InstallerFn, PackageInstaller, ReleaseClient, ReleaseInstaller};
 pub use manager::{
     BatchOutcome, Cache, Config, Dependency, DependencyFailure, DependencyReport, EnsureOptions,
     Manager, MemoryCache,
 };
 pub use process::{
-    CommandRunner, ProcessRunner, ensure_managed_bin_dir, is_agent_mode, managed_bin_dir,
-    managed_path, sanitize_stderr,
+    CommandRunner, DEFAULT_TERMINATION_GRACE, ProcessRunner, ensure_managed_bin_dir, is_agent_mode,
+    managed_bin_dir, managed_path, sanitize_stderr,
 };
 pub use tokio_util::sync::CancellationToken;
 pub use version::{compare_versions, default_version_parser};
+pub use yt_dlp::YtDlpInstaller;
 
 use std::{future::Future, io};
 

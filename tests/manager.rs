@@ -373,9 +373,7 @@ async fn executables_still_open_for_writing_are_retried_until_closed() {
         drop(writer);
     };
     let runner = ProcessRunner::default();
-    let (output, ()) = tokio::join!(
-        runner.run(path.to_str().unwrap(), &[], &CancellationToken::new()),
-        close
-    );
+    let token = CancellationToken::new();
+    let (output, ()) = tokio::join!(runner.run(path.to_str().unwrap(), &[], &token), close);
     assert_eq!(output.unwrap(), b"ran\n");
 }

@@ -16,6 +16,6 @@ lint:
     cargo clippy --all-targets -- -D warnings
 
 coverage:
-    cargo llvm-cov --all-targets --fail-under-lines 90
+    cargo llvm-cov --all-targets --fail-under-lines 90 --fail-under-functions 90
 
 check: lint test coverage

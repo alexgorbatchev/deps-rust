@@ -28,6 +28,13 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+
 [dev-dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["net"] }
+
+[[test]]
+name = "windows"
+harness = false

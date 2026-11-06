@@ -42,6 +42,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -53,3 +54,10 @@ jobs:
 
       - name: Lint all targets
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Windows installation
+        run: cargo test --test windows --locked -- --installs
+
+      - name: Windows process ownership
+        if: ${{ !cancelled() }}
+        run: cargo test --test windows --locked -- --processes

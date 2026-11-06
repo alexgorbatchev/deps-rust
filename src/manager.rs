@@ -1,7 +1,7 @@
 use crate::{
     CancellationToken, CommandRunner, Error, Installer, ProcessRunner, Result, compare_versions,
     default_version_parser, ensure_managed_bin_dir, is_agent_mode, managed_path, message,
-    process::{global_path, join_path, managed_dirs},
+    process::{global_path, is_managed_dir, join_path, managed_dirs},
 };
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -160,10 +160,6 @@ pub struct Manager {
     cache: Option<Arc<dyn Cache>>,
     bin_dir: PathBuf,
     global_path: Option<OsString>,
-    managed_path: OsString,
-    /// Child `PATH` orders: global entries first, and managed directories first.
-    global_first: OsString,
-    managed_first: OsString,
 }
 impl Manager {
     pub fn new(config: Config) -> Result<Self> {
@@ -194,14 +190,7 @@ impl Manager {
                 })
             }),
             cache: config.cache,
-            global_first: managed_path(&bin_dir, global.as_deref())?,
-            managed_first: join_path(
-                managed_dirs(&bin_dir)
-                    .into_iter()
-                    .chain(global.iter().flat_map(std::env::split_paths)),
-            )?,
             global_path: global,
-            managed_path: managed_path(&bin_dir, None)?,
             bin_dir,
         })
     }
@@ -210,10 +199,18 @@ impl Manager {
     }
 
     pub async fn verify(&self, token: &CancellationToken) -> Result<Vec<DependencyReport>> {
+        self.verify_in(&managed_path(&self.bin_dir, None)?, token)
+            .await
+    }
+    async fn verify_in(
+        &self,
+        managed: &OsStr,
+        token: &CancellationToken,
+    ) -> Result<Vec<DependencyReport>> {
         let results = join_all(
             self.dependencies
                 .iter()
-                .map(|dependency| self.verify_one(dependency, token)),
+                .map(|dependency| self.verify_one_in(dependency, managed, token)),
         )
         .await;
         results.into_iter().collect()
@@ -239,24 +236,32 @@ impl Manager {
     /// the global copy satisfies the minimum returns `Error::Unsatisfied`; update
     /// that dependency to resolve it.
     pub async fn child_path(&self, token: &CancellationToken) -> Result<OsString> {
-        let reports = self.verify(token).await?;
-        let managed = managed_dirs(&self.bin_dir);
+        // Resolve the selector once: verification and the returned PATH must
+        // use the same generation even when an install publishes concurrently.
+        let managed = managed_dirs(&self.bin_dir)?;
+        let managed_path = join_path(managed.clone())?;
+        let reports = self.verify_in(&managed_path, token).await?;
         let is_managed = |report: &DependencyReport| {
             report
                 .path
                 .as_deref()
                 .and_then(Path::parent)
-                .is_some_and(|dir| managed.iter().any(|m| m == dir))
+                .is_some_and(|dir| is_managed_dir(&self.bin_dir, dir))
         };
         if !reports.iter().any(|r| r.satisfied && is_managed(r)) {
-            return Ok(self.global_first.clone());
+            return join_path(
+                self.global_path
+                    .iter()
+                    .flat_map(std::env::split_paths)
+                    .chain(managed),
+            );
         }
         let cwd = std::env::current_dir()?;
         for (dependency, report) in self.dependencies.iter().zip(&reports) {
             if !report.satisfied || is_managed(report) {
                 continue;
             }
-            let Ok(copy) = which::which_in(&dependency.name, Some(&self.managed_path), &cwd) else {
+            let Ok(copy) = which::which_in(&dependency.name, Some(&managed_path), &cwd) else {
                 continue;
             };
             let shadow = self
@@ -269,7 +274,11 @@ impl Manager {
                 )));
             }
         }
-        Ok(self.managed_first.clone())
+        join_path(
+            managed
+                .into_iter()
+                .chain(self.global_path.iter().flat_map(std::env::split_paths)),
+        )
     }
     fn dependency(&self, name: &str) -> Result<&Dependency> {
         self.dependencies
@@ -279,14 +288,14 @@ impl Manager {
     }
     /// Locates the global executable, then the managed one.
     fn candidates(&self, name: &str) -> Result<Vec<PathBuf>> {
+        self.candidates_in(name, &managed_path(&self.bin_dir, None)?)
+    }
+    fn candidates_in(&self, name: &str, managed: &OsStr) -> Result<Vec<PathBuf>> {
         let cwd = std::env::current_dir()?;
         let mut candidates = Vec::new();
-        for path in [
-            self.global_path.as_deref(),
-            Some(self.managed_path.as_os_str()),
-        ]
-        .into_iter()
-        .flatten()
+        for path in [self.global_path.as_deref(), Some(managed)]
+            .into_iter()
+            .flatten()
         {
             if let Ok(found) = which::which_in(name, Some(path), &cwd)
                 && !candidates.contains(&found)
@@ -301,10 +310,19 @@ impl Manager {
         dependency: &Dependency,
         token: &CancellationToken,
     ) -> Result<DependencyReport> {
+        self.verify_one_in(dependency, &managed_path(&self.bin_dir, None)?, token)
+            .await
+    }
+    async fn verify_one_in(
+        &self,
+        dependency: &Dependency,
+        managed: &OsStr,
+        token: &CancellationToken,
+    ) -> Result<DependencyReport> {
         if token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let mut candidates = self.candidates(&dependency.name)?.into_iter();
+        let mut candidates = self.candidates_in(&dependency.name, managed)?.into_iter();
         // Without a located executable the runner resolves the name itself.
         let Some(first) = candidates.next() else {
             return self

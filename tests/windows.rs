@@ -46,6 +46,15 @@ mod windows {
     pub fn main() {
         let args: Vec<_> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
+            Some("--output") => {
+                let bytes = vec![b'x'; 256 * 1024];
+                std::io::stdout().write_all(&bytes).unwrap();
+                std::io::stderr().write_all(&bytes).unwrap();
+            }
+            Some("--failure") => {
+                eprintln!("fixture command failed");
+                std::process::exit(7);
+            }
             Some("--version") => {
                 let root = std::env::current_exe().unwrap();
                 println!(
@@ -70,6 +79,7 @@ mod windows {
                         installs_remain_resolvable().await;
                     }
                     if processes {
+                        command_results().await;
                         for abort in [false, true] {
                             for graceful in [false, true] {
                                 cancellation_owns_tree(abort, graceful).await;
@@ -325,7 +335,47 @@ mod windows {
             .unwrap(),
             selected
         );
+        let selector = bin.join(".yt-dlp/active");
+        let previous = std::fs::read(&selector).unwrap();
+        for invalid in ["../outside", "install-missing"] {
+            std::fs::write(&selector, invalid).unwrap();
+            assert!(managed.executable("yt-dlp", &token).await.is_err());
+            assert!(managed.child_path(&token).await.is_err());
+        }
+        std::fs::write(&selector, previous).unwrap();
+        assert_eq!(version(&first).await, "2026.01.01");
         server.finish().await;
+    }
+
+    async fn command_results() {
+        let runner = ProcessRunner::default();
+        let executable = std::env::current_exe().unwrap();
+        let token = CancellationToken::new();
+        let output = runner
+            .run(executable.as_os_str(), &["--output".into()], &token)
+            .await
+            .unwrap();
+        assert_eq!(output, vec![b'x'; 256 * 1024]);
+        let error = runner
+            .run(executable.as_os_str(), &["--failure".into()], &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Command { status, stderr, .. }
+            if status.code() == Some(7) && stderr.contains("fixture command failed")));
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            runner
+                .run(root.path().join("missing.exe").as_os_str(), &[], &token)
+                .await,
+            Err(Error::Io(_))
+        ));
+        token.cancel();
+        assert!(matches!(
+            runner
+                .run(executable.as_os_str(), &["--failure".into()], &token)
+                .await,
+            Err(Error::Cancelled)
+        ));
     }
 
     // Independent safety net: assertions observe the runner's cleanup before

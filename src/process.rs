@@ -1,11 +1,14 @@
 use crate::{CancellationToken, Error, Result, message};
 use async_trait::async_trait;
+#[cfg(not(windows))]
+use std::process::{Output, Stdio};
 use std::{
     ffi::{OsStr, OsString},
     path::{Component, Path, PathBuf},
-    process::{Output, Stdio},
     time::Duration,
 };
+#[cfg(windows)]
+mod windows;
 
 pub fn is_agent_mode() -> bool {
     std::env::var("AGENT")
@@ -46,12 +49,18 @@ pub fn ensure_managed_bin_dir(app_name: &str) -> Result<PathBuf> {
 ///
 /// Windows cannot link an unpacked yt-dlp build into `bin_dir` without symbolic
 /// links, so its install folder is searched directly.
-pub(crate) fn managed_dirs(bin_dir: &Path) -> Vec<PathBuf> {
-    vec![
-        #[cfg(not(unix))]
-        crate::yt_dlp::windows_entry_dir(bin_dir),
-        bin_dir.to_owned(),
-    ]
+pub(crate) fn managed_dirs(bin_dir: &Path) -> Result<Vec<PathBuf>> {
+    let dirs = vec![bin_dir.to_owned()];
+    #[cfg(not(unix))]
+    let dirs = crate::yt_dlp::windows_entry_dir(bin_dir)?
+        .into_iter()
+        .chain(dirs)
+        .collect();
+    Ok(dirs)
+}
+
+pub(crate) fn is_managed_dir(bin_dir: &Path, directory: &Path) -> bool {
+    directory == bin_dir || cfg!(windows) && directory.starts_with(bin_dir.join(".yt-dlp"))
 }
 
 /// Returns a child-process PATH without mutating the process environment.
@@ -65,7 +74,8 @@ pub fn managed_path(bin_dir: &Path, current: Option<&OsStr>) -> Result<OsString>
         .map(std::env::split_paths)
         .map(Iterator::collect::<Vec<_>>)
         .unwrap_or_default();
-    for dir in managed_dirs(bin_dir) {
+    paths.retain(|path| !is_managed_dir(bin_dir, path));
+    for dir in managed_dirs(bin_dir)? {
         if !paths.contains(&dir) {
             paths.push(dir);
         }
@@ -79,12 +89,11 @@ pub(crate) fn join_path(paths: impl IntoIterator<Item = PathBuf>) -> Result<OsSt
 
 /// Removes the managed directories from a search PATH, leaving global entries.
 pub(crate) fn global_path(bin_dir: &Path, current: Option<&OsStr>) -> Option<OsString> {
-    let managed = managed_dirs(bin_dir);
     let paths = current
         .map(std::env::split_paths)
         .map(|paths| {
             paths
-                .filter(|p| !p.as_os_str().is_empty() && !managed.contains(p))
+                .filter(|p| !p.as_os_str().is_empty() && !is_managed_dir(bin_dir, p))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -139,9 +148,13 @@ pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 /// On Unix each child starts in a new session, which makes it the leader of its
 /// own process group. Cancelling the token, or dropping the `run` future, sends
 /// SIGTERM to the whole group and SIGKILL only when a member is still alive after
-/// `termination_grace`. On Windows the child is terminated with `TerminateProcess`.
+/// `termination_grace`. On Windows a child starts suspended, enters an owned Job
+/// Object, and resumes in its own console process group. Cancellation requests
+/// CTRL_BREAK when the caller and child share a console, then terminates the job
+/// after the grace period. Both platforms retain ownership until exit is
+/// confirmed, draining output while they wait.
 ///
-/// The new session has no controlling terminal, so terminal signals such as
+/// The Unix session has no controlling terminal, so terminal signals such as
 /// Ctrl-C do not reach the child: callers translate SIGINT and SIGTERM into token
 /// cancellation, for example with `tokio::signal::ctrl_c`. A child that tries to
 /// prompt on the terminal, such as `sudo`, fails instead of stopping in the
@@ -183,30 +196,42 @@ impl CommandRunner for ProcessRunner {
         } else {
             PathBuf::from(program)
         };
-        let mut command = tokio::process::Command::new(executable);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(path) = &self.path {
-            command.env("PATH", path);
-        }
-        let mut child = ChildGroup::spawn(command, self.termination_grace).await?;
-        let finished = {
-            let output = child.output();
-            tokio::pin!(output);
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => None,
-                output = &mut output => Some(output),
+        #[cfg(windows)]
+        let output = windows::run(
+            executable,
+            args,
+            self.path.as_deref(),
+            self.termination_grace,
+            token,
+        )
+        .await?;
+        #[cfg(not(windows))]
+        let output = {
+            let mut command = tokio::process::Command::new(executable);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(path) = &self.path {
+                command.env("PATH", path);
             }
+            let mut child = ChildGroup::spawn(command, self.termination_grace).await?;
+            let finished = {
+                let output = child.output();
+                tokio::pin!(output);
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    output = &mut output => Some(output),
+                }
+            };
+            let Some(output) = finished else {
+                child.terminate().await?;
+                return Err(Error::Cancelled);
+            };
+            output?
         };
-        let Some(output) = finished else {
-            child.terminate().await?;
-            return Err(Error::Cancelled);
-        };
-        let output = output?;
         if !output.status.success() {
             return Err(Error::Command {
                 name: program.to_string_lossy().into_owned(),
@@ -219,9 +244,11 @@ impl CommandRunner for ProcessRunner {
 }
 
 /// Retries of a spawn that fails because the executable is busy, 10 ms apart.
+#[cfg(not(windows))]
 const SPAWN_BUSY_RETRIES: u32 = 100;
 
 /// A spawned child that is terminated with its process group unless it finishes.
+#[cfg(not(windows))]
 struct ChildGroup {
     child: Option<tokio::process::Child>,
     /// The output pipes stay open until the group is gone: closing them early
@@ -236,6 +263,7 @@ struct ChildGroup {
     grace: Duration,
 }
 
+#[cfg(not(windows))]
 impl ChildGroup {
     async fn spawn(mut command: tokio::process::Command, grace: Duration) -> std::io::Result<Self> {
         #[cfg(unix)]
@@ -342,6 +370,7 @@ impl ChildGroup {
     }
 }
 
+#[cfg(not(windows))]
 async fn read_pipe(
     pipe: Option<&mut (impl tokio::io::AsyncRead + Unpin)>,
 ) -> std::io::Result<Vec<u8>> {
@@ -353,6 +382,7 @@ async fn read_pipe(
     Ok(bytes)
 }
 
+#[cfg(not(windows))]
 impl Drop for ChildGroup {
     fn drop(&mut self) {
         #[cfg(unix)]

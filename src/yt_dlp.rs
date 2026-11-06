@@ -12,11 +12,12 @@
 //!   install replaces the link with one atomic rename, which also replaces an
 //!   obsolete one-file `yt-dlp`. It keeps the install it replaced, so a yt-dlp
 //!   still running from it can finish, and removes older ones.
-//! - Windows: `.yt-dlp/current/` holds the build and is searched before the managed
-//!   directory. A new install renames the previous folder aside, renames the new one
-//!   into place, restores the previous one if that fails, and removes the obsolete
-//!   one-file `yt-dlp.exe`. Windows refuses to rename a folder whose executable is
-//!   running, so the replaced folder is never in use and is removed.
+//! - Windows: `.yt-dlp/active` selects a complete, immutable `install-*` folder.
+//!   Publication atomically replaces this selector file; readers resolve either
+//!   complete generation. Managed lookups search the selected folder before the
+//!   managed directory. Published generations are retained because returned paths
+//!   and child PATHs can outlive an update. The obsolete one-file `yt-dlp.exe` is
+//!   removed after publication.
 //!
 //! Installs into one managed directory hold an exclusive lock on `.yt-dlp/.lock`
 //! from extraction through cleanup, so concurrent installs never remove each
@@ -28,10 +29,26 @@ use std::path::{Path, PathBuf};
 /// Folder under the managed directory that holds unpacked yt-dlp builds.
 const PACKAGE_DIR: &str = ".yt-dlp";
 
-/// The Windows install folder, which managed lookups search directly.
+/// Resolve the atomically published Windows install generation.
 #[cfg(not(unix))]
-pub(crate) fn windows_entry_dir(bin_dir: &Path) -> PathBuf {
-    bin_dir.join(PACKAGE_DIR).join("current")
+pub(crate) fn windows_entry_dir(bin_dir: &Path) -> Result<Option<PathBuf>> {
+    let root = bin_dir.join(PACKAGE_DIR);
+    let name = match std::fs::read_to_string(root.join("active")) {
+        Ok(name) => name,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // Only our generated basename is a selector, never an arbitrary path.
+    if !name.starts_with("install-")
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(message("invalid yt-dlp install selector"));
+    }
+    let install = root.join(name);
+    if !install.is_dir() {
+        return Err(message("selected yt-dlp install directory is missing"));
+    }
+    Ok(Some(install))
 }
 
 /// An unpacked release archive and the executable at its root.
@@ -176,35 +193,37 @@ fn activate(staging: tempfile::TempDir, entry_name: &str, directory: &Path) -> R
     Ok(entry)
 }
 
-/// Swaps the staged install into the folder Windows lookups search. The caller
-/// holds the install lock.
+/// Publish a complete immutable generation with one file replacement. The
+/// caller holds the install lock. Returned paths and child PATHs can outlive an
+/// update, so published generations must not be reclaimed by the installer.
 #[cfg(not(unix))]
 fn activate(staging: tempfile::TempDir, entry_name: &str, directory: &Path) -> Result<PathBuf> {
+    use std::io::Write;
     let root = directory.join(PACKAGE_DIR);
-    let current = windows_entry_dir(directory);
+    let mut selector = tempfile::Builder::new()
+        .prefix(".active-")
+        .tempfile_in(&root)?;
+    let name = staging
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| message("staged yt-dlp install has no UTF-8 basename"))?;
+    selector.write_all(name.as_bytes())?;
+    selector.flush()?;
     let install = staging.keep();
-    let retired = install.with_extension("retired");
-    let had_previous = current.exists();
-    if had_previous && let Err(error) = std::fs::rename(&current, &retired) {
+    if let Err(error) = selector.persist(root.join("active")) {
         std::fs::remove_dir_all(&install)?;
-        return Err(error.into());
-    }
-    if let Err(error) = std::fs::rename(&install, &current) {
-        if had_previous {
-            std::fs::rename(&retired, &current)?;
-        }
-        std::fs::remove_dir_all(&install)?;
-        return Err(error.into());
+        return Err(error.error.into());
     }
     let obsolete = directory.join(entry_name);
     if obsolete.is_file() {
         std::fs::remove_file(obsolete)?;
     }
-    remove_other_installs(&root, &[Some("current".into())])?;
-    Ok(current.join(entry_name))
+    Ok(install.join(entry_name))
 }
 
 /// Removes install folders other than `keep`; files such as in-flight downloads stay.
+#[cfg(unix)]
 fn remove_other_installs(root: &Path, keep: &[Option<std::ffi::OsString>]) -> Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;

@@ -203,7 +203,7 @@ impl CommandRunner for ProcessRunner {
             }
         };
         let Some(output) = finished else {
-            child.terminate().await;
+            child.terminate().await?;
             return Err(Error::Cancelled);
         };
         let output = output?;
@@ -299,18 +299,21 @@ impl ChildGroup {
     }
 
     /// Ends the group and waits until every member has exited or been killed.
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(reaper) = self.start_termination() {
             // Should this wait be dropped, the blocking task still finishes, and
             // the runtime waits for it when it shuts down.
-            let _ = tokio::task::spawn_blocking(move || reaper.run()).await;
+            tokio::task::spawn_blocking(move || reaper.run())
+                .await
+                .map_err(std::io::Error::other)?;
         }
         #[cfg(not(unix))]
         if let Some(mut child) = self.child.take() {
             let _ = self.grace;
-            let _ = child.kill().await;
+            child.kill().await?;
         }
+        Ok(())
     }
 
     /// Sends SIGTERM to the group and returns the reaper that finishes ending it.
@@ -357,7 +360,7 @@ impl Drop for ChildGroup {
             // Runtime shutdown waits for blocking tasks, so the escalation still
             // happens when the program exits right after dropping `run`. A task
             // the shutting-down runtime discards drops its reaper, which then
-            // sends SIGKILL at once.
+            // sends SIGKILL at once and waits synchronously for group exit.
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn_blocking(move || reaper.run());
             } else {
@@ -381,8 +384,8 @@ fn signal_group(pid: Option<rustix::process::Pid>, signal: rustix::process::Sign
 /// Finishes terminating a process group that has received SIGTERM.
 ///
 /// Dropping a reaper that has not finished sends SIGKILL to the group at once,
-/// so discarding it, for example with a shutting-down runtime's queued blocking
-/// tasks, never leaves the group running.
+/// and waits for group exit, so discarding it, for example with a shutting-down
+/// runtime's queued blocking tasks, retains ownership until cleanup completes.
 #[cfg(unix)]
 struct Reaper {
     child: tokio::process::Child,
@@ -401,16 +404,21 @@ impl Reaper {
     /// A process group ID is not reused while the group has a member, and polling
     /// stops as soon as the group is empty, so the signals reach only this group.
     fn run(mut self) {
-        const KILL_WAIT: Duration = Duration::from_secs(1);
         if !self.wait(self.grace) {
-            signal_group(self.group, rustix::process::Signal::KILL);
-            // Kill the leader directly too, in case it left its group or
-            // signalling the group was refused. A member that still has not
-            // exited (for example, in uninterruptible sleep) is left behind, and
-            // Tokio's orphan reaper collects the leader.
-            let _ = self.child.start_kill();
-            self.wait(KILL_WAIT);
+            self.kill_and_wait();
         }
+        self.finished = true;
+    }
+
+    fn kill_and_wait(&mut self) {
+        const REAP_INTERVAL: Duration = Duration::from_secs(1);
+        signal_group(self.group, rustix::process::Signal::KILL);
+        // Kill the leader directly too, in case it left its group or
+        // signalling the group was refused. SIGKILL does not establish exit:
+        // a member can remain in uninterruptible sleep or await reaping.
+        // Keep ownership and drain output until the group is actually gone.
+        let _ = self.child.start_kill();
+        while !self.wait(REAP_INTERVAL) {}
         self.finished = true;
     }
 
@@ -432,10 +440,13 @@ impl Reaper {
     }
 
     fn exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
-            && !self
-                .group
-                .is_some_and(|pid| rustix::process::test_kill_process_group(pid).is_ok())
+        matches!(self.child.try_wait(), Ok(Some(_)))
+            && self.group.is_none_or(|pid| {
+                matches!(
+                    rustix::process::test_kill_process_group(pid),
+                    Err(rustix::io::Errno::SRCH)
+                )
+            })
     }
 
     /// Discards up to `DRAIN_LIMIT` bytes of available output from each pipe,
@@ -464,8 +475,7 @@ impl Reaper {
 impl Drop for Reaper {
     fn drop(&mut self) {
         if !self.finished {
-            signal_group(self.group, rustix::process::Signal::KILL);
-            let _ = self.child.start_kill();
+            self.kill_and_wait();
         }
     }
 }

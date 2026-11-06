@@ -1,6 +1,6 @@
 ---
 created_on: 2026-10-14 05:46
-last_modified: 2026-11-05 21:11
+last_modified: 2026-11-05 21:24
 status: current
 ---
 
@@ -15,7 +15,7 @@ This library manages external executables. It has no CLI entrypoint.
 - `just lint`: check formatting and Clippy warnings.
 - `just coverage`: require at least 90% line and function coverage of `src/` with cargo-llvm-cov and llvm-tools.
 - `just check`: run lint, tests, and coverage.
-- CI (`.github/workflows/ci.yml`) runs `just check` on Linux and macOS, and all-target lint plus native installation and process-ownership regressions on Windows, for pull requests and pushes to `main`.
+- CI (`.github/workflows/ci.yml`) runs `just check` on Linux and macOS, and all-target lint plus native installation and process-ownership regressions with coverage reporting on Windows, for pull requests and pushes to `main`. All three platforms explicitly run the ignored `yt_dlp_smoke` test against the current upstream release to verify managed execution leaves no new `_MEI` runtime directories.
 
 ## Contracts
 

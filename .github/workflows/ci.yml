@@ -40,6 +40,9 @@ jobs:
       - name: Check
         run: just check
 
+      - name: Real managed yt-dlp
+        run: cargo test --test yt_dlp_smoke --locked -- --ignored --nocapture
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -48,7 +51,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
@@ -61,3 +64,13 @@ jobs:
       - name: Windows process ownership
         if: ${{ !cancelled() }}
         run: cargo test --test windows --locked -- --processes
+
+      - name: Real managed yt-dlp
+        run: cargo test --test yt_dlp_smoke --locked -- --ignored --nocapture
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Native Windows coverage
+        run: cargo llvm-cov --test windows --locked --show-missing-lines
